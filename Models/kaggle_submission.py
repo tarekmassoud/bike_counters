@@ -2,20 +2,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import sklearn
 import holidays
 
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import FunctionTransformer
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import Ridge
-from sklearn.pipeline import Pipeline
 from sklearn.neighbors import BallTree
+from sklearn.pipeline import Pipeline
+from xgboost import XGBRegressor
+from sklearn.preprocessing import OneHotEncoder
 
-df_train = pd.read_parquet(Path("data") / "train.parquet")
-df_test = pd.read_parquet(Path("data") / "final_test.parquet")
+df_train = pd.read_parquet(Path("../data") / "train.parquet")
+df_test = pd.read_parquet(Path("../data") / "final_test.parquet")
 
 X_train = df_train.drop(columns=['log_bike_count', 'bike_count'])
 y_train = df_train['log_bike_count']
@@ -34,7 +30,8 @@ def _encode_dates(X):
     return X.drop(columns=["date"])
 
 def _drop_init_cols(X):
-    return X.drop(columns=['coordinates',
+    return X.drop(columns=['counter_name',
+                           'coordinates',
                            'site_name',
                            'site_id',
                            'counter_technical_id',
@@ -42,18 +39,19 @@ def _drop_init_cols(X):
                            ])
 
 def _merge_external_data(X):
-    file_path = Path("Notebooks") / "weather_v1.csv"
+    file_path = Path("../Notebooks") / "weather_v1.csv"
     df_ext = pd.read_csv(file_path, parse_dates=["date"])
 
     X = X.copy()
     # When using merge_asof left frame need to be sorted
     X["orig_index"] = np.arange(X.shape[0])
     X = pd.merge_asof(
-        X.sort_values("date"), df_ext[['date', 'numer_sta', 'pmer', 'tend', 'cod_tend', 
-                                       'dd', 'ff', 't', 'td','u', 'vv', 'ww',  
-                                       'n', 'nbas', 'pres', 'tend24', 'raf10', 
-                                       'per',  'rr24']].sort_values("date"), on="date"
-    ) #'w1', 'w2', 'rafper', 'etat_sol', 'ht_neige', 'rr1', 'rr3', 'rr6', 'rr12',
+        X.sort_values("date"), df_ext[['date', 'pres_diff', 'pmer', 'tend', 'cod_tend',
+                                       'dd', 'ff', 't', 'td','u', 'vv', 'tend24', 'ww', 
+                                       'n', 'pres', 'raf10',  'nbas',
+                                       'ht_neige', 'rr1', 'rr6']].sort_values("date"), on="date"
+    )  
+
     # Sort back to the original order
     X = X.sort_values("orig_index")
     del X["orig_index"]
@@ -65,7 +63,8 @@ def _add_holiday_column(X):
     X = X.copy()
 
     def is_holiday(date):
-        if date in fr_holidays:
+        weekday = date.weekday()
+        if weekday > 4 or date in fr_holidays:
             return 1
         else:
             return 0
@@ -75,62 +74,81 @@ def _add_holiday_column(X):
     return X
 
 def _merge_connected_roads(X):
-    file_path = Path("Notebooks") / "reseau_cyclable_v1.csv"
+    file_path = Path("../Notebooks") / "reseau_cyclable_v1.csv"
     df_cyclable_roads = pd.read_csv(file_path)
 
-    lat_lon_cyclable_roads = np.deg2rad(df_cyclable_roads[['latitude', 'longitude']].values) # converting lat and lon to rad (required for haversine calculation)
-    lat_lon_original = np.deg2rad(X[['latitude', 'longitude']].values)
+    lat_lon_cyclable_roads = np.deg2rad(df_cyclable_roads[['latitude', 'longitude']].values)
+    lat_lon_original = np.deg2rad(X[['latitude', 'longitude']].values) # here, we converted the latitude and longitude to radians for the next computation
+    tree = BallTree(lat_lon_cyclable_roads, metric='haversine')
 
-    tree = BallTree(lat_lon_cyclable_roads, metric='haversine') # create a BallTree with cyclable roads' coordinates
+    radius = 100 / 6371000 # for a radius of 100m (converted in radians)
+    indices = tree.query_radius(lat_lon_original, r=radius)# search the tree for stations that are within the defined radius
 
-    radius = 100 / 6371000 # here, we define a search radius of 100 and convert it to radians (according to earth radius)
-
-    # Query the tree for roads within the radius for each bike traffic point
-    indices = tree.query_radius(lat_lon_original, r=radius)
-
-    X = X.copy() # copy the DataFrame to avoid modifying the original one
-
-    # Count the number of roads within the radius for each site and add to DataFrame
-    X['number_of_connected_roads'] = [len(index) for index in indices]
+    X = X.copy()
+    X['number_of_connected_roads'] = [len(index) for index in indices] # here, we count the number of roads within the radius for each site and add to the new feature
 
     return X
 
 def _merge_velib_info(X):
-    file_path = Path("Notebooks") / "info_velib_v1.csv"
+    file_path = Path("../Notebooks") / "info_velib_v1.csv"
     df_velib = pd.read_csv(file_path)
 
-    # Convert lat/lon to radians for haversine distance calculation
     lat_lon_stations = np.deg2rad(df_velib[['latitude', 'longitude']].values)
-    lat_lon_original = np.deg2rad(X[['latitude', 'longitude']].values)
-
-    # Create a BallTree with station coordinates
+    lat_lon_original = np.deg2rad(X[['latitude', 'longitude']].values) # here, again, we converted the latitude and longitude to radians for the next computation
     tree = BallTree(lat_lon_stations, metric='haversine')
 
-    # Define your search radius in meters and convert to radians (Earth radius is approximately 6371 km)
-    radius = 200 / 6371000  # Example radius of 500 meters
+    radius = 150 / 6371000  
+    indices = tree.query_radius(lat_lon_original, r=radius) 
 
-    # Query the tree for stations within the radius for each point in X
-    indices = tree.query_radius(lat_lon_original, r=radius)
+    X = X.copy() 
 
-    X = X.copy() # copy the DataFrame to avoid modifying the original one
-
-    # Calculate the sum of capacities for stations within the radius for each site in X
     X['total_nearby_station_capacity'] = [df_velib.iloc[index]['Capacité de la station'].sum() for index in indices]
-    X['number_of_nearby_stations'] = [len(index) for index in indices]
+    X['number_of_nearby_stations'] = [len(index) for index in indices] # here, we create two new features to add to our final dataset
 
     return X
 
-date_encoder = FunctionTransformer(_encode_dates)
-is_holiday_col = FunctionTransformer(_add_holiday_column)
-init_data_eng = FunctionTransformer(_drop_init_cols)
-merge_external_data = FunctionTransformer(_merge_external_data, validate=False)
-merge_connected_roads = FunctionTransformer(_merge_connected_roads)
-merge_velib_info = FunctionTransformer(_merge_velib_info)
+def _process_column_id(X):
+    # Here, we drop the first part of the counter_id feature and add to it the longitude and latitude features; the resulting column will be one hot encoded later on
+    X = X.copy() 
+    
+    def process_id(counter_id): # we added this function because we noticed some rows contained non-numeric values
+        parts = counter_id.split('-')
+        return parts[1] if parts[1].isdigit() else parts[0]
+    
+    X['counter_id'] = X['counter_id'].apply(process_id).astype(str)
 
-categorical_columns = ['counter_id', 'counter_name']
-one_hot = OneHotEncoder(handle_unknown='ignore')
+    X['longitude'] = X['longitude'].astype(str)
+    X['latitude'] = X['latitude'].astype(str)
+
+    X['counter_id'] = X['counter_id'] + '_' + X['longitude'] + '_' + X['latitude']
+
+    return X.drop(columns=['latitude', 'longitude'])
+
+def _merge_fuel_index(X):
+    # To merge the fuel index dataset on the date 
+    file_path = Path("../Notebooks") / "fuel_index_v1.csv"
+    df_fuel = pd.read_csv(file_path)
+    
+    X['date'] = pd.to_datetime(X['date'])
+    X['year'] = X['date'].dt.year
+    X['month'] = X['date'].dt.month
+
+    X = X.copy()
+
+    X = pd.merge(
+        X, 
+        df_fuel, 
+        on=['year', 'month'],
+        how='left'
+    )
+
+    return X.drop(['year', 'month'], axis=1)
 
 def one_hot_encode_and_concat(X):
+    # One hot encoder function
+    categorical_columns = ['counter_id'] 
+    one_hot = OneHotEncoder(handle_unknown='ignore')
+
     one_hot_encoded_data = one_hot.fit_transform(X[categorical_columns])
 
     one_hot_encoded_df = pd.DataFrame(one_hot_encoded_data.toarray(), 
@@ -142,18 +160,31 @@ def one_hot_encode_and_concat(X):
     return X_encoded
 
 one_hot_transformer = FunctionTransformer(one_hot_encode_and_concat)
+date_encoder = FunctionTransformer(_encode_dates)
+is_holiday_col = FunctionTransformer(_add_holiday_column)
+init_data_eng = FunctionTransformer(_drop_init_cols)
+merge_external_data = FunctionTransformer(_merge_external_data, validate=False)
+merge_connected_roads = FunctionTransformer(_merge_connected_roads)
+merge_velib_info = FunctionTransformer(_merge_velib_info)
+process_column_id = FunctionTransformer(_process_column_id)
+merge_fuel_index = FunctionTransformer(_merge_fuel_index)
 
-regressor = RandomForestRegressor(max_depth=20, 
-                                  n_estimators=100, 
-                                  random_state=42)
+regressor = XGBRegressor(
+    max_depth=8, 
+    n_estimators=200,
+    learning_rate=0.08, 
+    random_state=None
+)
 
 pipeline = Pipeline([
     ("merging_ext_data", merge_external_data),
     ("adding_is_holiday_column", is_holiday_col),
     ("merging_connected_roads_data", merge_connected_roads),
     ("merging_velib_info", merge_velib_info),
+    ("merging_fuel_index_info", merge_fuel_index),
     ("encoding_dates", date_encoder),
     ("dropping_redundant_columns_in_initial_data", init_data_eng),
+    ("processing_column_id", process_column_id),
     ("one_hot_encoding", one_hot_transformer),
     ("regressor", regressor)
 ])
